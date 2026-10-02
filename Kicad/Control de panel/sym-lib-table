@@ -1,0 +1,6 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "ESP32_DEVKIT_V1_30PIN")(type "KiCad")(uri "${KIPRJMOD}/lib/ESP32_DEVKIT_V1_30PIN.kicad_sym")(options "")(descr "DOIT ESP32 DevKit V1 30-Pin"))
+  (lib (name "CNY74-4H")(type "KiCad")(uri "D:/2026/FIE 5to/Tecnologia electronica/kicad/KiCad libreria/KiCad libreria/CNY74-4H.kicad_sym")(options "")(descr ""))
+  (lib (name "DEVKIT_V1_ESP32-WROOM-32")(type "KiCad")(uri "D:/2026/FIE 5to/Tecnologia electronica/kicad/KiCad libreria/KiCad libreria/DEVKIT_V1_ESP32-WROOM-32.kicad_sym")(options "")(descr ""))
+)

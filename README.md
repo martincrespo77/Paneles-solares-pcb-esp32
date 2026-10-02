@@ -1,122 +1,98 @@
-# Comunicacion laser FSO con ESP32
+# Seguidor Solar (Sun Tracker) de 2 Ejes con ESP32
 
-Proyecto de practica para validar comunicacion optica por laser entre dos ESP32. El
-objetivo de esta etapa es probar el enlace fisico y transportar telemetria solar
-simulada, tomada del trabajo de Tecnicas Digitales 2, sin duplicar el proyecto TD2
-completo dentro de este repositorio.
+**Cátedra:** Técnicas Digitales 2 — FIE (Facultad de Ingeniería del Ejército)  
+**Estado:** Firmware base implementado y verificado en PlatformIO  
 
-El repositorio actual contiene solamente el firmware PlatformIO necesario para la
-practica de comunicacion laser:
+---
 
-- `src/main_tx.cpp`: nodo transmisor. Genera telemetria simulada y la envia por
-  GPIO17 usando codificacion Manchester.
-- `src/main_rx.cpp`: nodo receptor. Lee el haz con un LDR en ADC GPIO34, decodifica
-  Manchester, valida CRC32 y publica un dashboard web en modo AP.
-- `platformio.ini`: entornos de compilacion y carga para TX y RX.
-- `docs/`: documentacion tecnica vigente del enlace.
+## 1. Descripción del Proyecto
 
-La documentacion vieja basada en MicroPython, JSON por UART y pruebas cableadas de
-1200 baudios queda obsoleta para esta practica. No se mantiene duplicada en el repo
-activo porque contradice el protocolo vigente.
+Este proyecto consiste en la **migración y modernización del sistema de control del Seguidor Solar (Sun Tracker) de dos ejes** (Azimut y Elevación). 
 
-## Estado actual
+El sistema original estaba implementado en código de bajo nivel en C para un microcontrolador AVR (**ATmega168/328**) utilizando el puente H L298HN y un demultiplexor CD4053 (referencia: informe técnico `UNDEFI 263` en `INFORMACION VIEJA/`).
 
-- Enlace: laser/FSO entre ESP32.
-- Codificacion fisica: Manchester a 20 bps.
-- Periodo de envio automatico: 20 s.
-- Trama: preambulo, byte de sincronismo, longitud, payload binario y CRC32.
-- Telemetria: datos simulados de panel solar/tracker (`F0..F3`, error de azimut,
-  error de elevacion, motores, tension, corriente y potencia).
-- RX: dashboard web local desde el AP `FSO-RX`.
+En esta etapa se porta el núcleo de control hacia un microcontrolador moderno **ESP32 DOIT DevKit V1 (30 pines)** bajo el framework PlatformIO / Arduino C++, conservando las ecuaciones físicas del lazo de control, la calibración PI probada y la robustez del accionamiento.
 
-## Hardware usado
+---
 
-### Nodo TX
+## 2. Arquitectura de Control
 
-- ESP32 DOIT DevKit V1.
-- Salida laser en GPIO17.
-- Pulsador en GPIO4 con `INPUT_PULLUP`.
+```
+                 [ 4 LDRs en cruz: F0, F1, F2, F3 ]
+                                |
+                                v
+               [ ADC1 del ESP32 (4 canales a 10 bits) ]
+                                |
+                                v
+                [ Cálculo de error (Azimut / Elevación) ]
+                                |
+                                v
+             [ Control PI por eje con Anti-Windup y Deadband ]
+                                |
+                                v
+            [ Generación PWM (LEDC 1 kHz) + Señales de Sentido ]
+                                |
+                                v
+                [ Etapa de Potencia: Puente H Doble ]
+                                |
+                                v
+              [ Motores DC Azimut (P1) y Elevación (P2) ]
+```
 
-Modos:
+### Algoritmo y Ley de Control
 
-- Normal: envia una trama cada 20 s.
-- Apuntado: laser fijo encendido para alinear el haz.
+1. **Lectura ADC:** Lee los 4 sensores LDR sobre el ADC1 (evitando conflictos de Wi-Fi), aplicando promediado de 8 muestras y reescalado de 12 a 10 bits (`0..1023`) para mantener compatibilidad con las constantes legadas.
+2. **Cálculo de Error:**
+   - Elevación: `Error_El = (F2 + F3 - F0 - F1) / 2`
+   - Azimut: `Error_Az = (F1 + F3 - F0 - F2) / 2`
+3. **Controlador PI Discreto:**
+   - Ganancias: $K_p = 5.0$, $K_i = 0.1$, $K_d = 0.0$
+   - Límite Anti-Windup: Clamping del integrador a $\pm 400.0$
+   - Zona Muerta (`DEAD_BAND = 5`): Evita oscilaciones por jitter o ruido eléctrico cuando el panel está orientado.
+4. **Modulación PWM:** Canales LEDC a 1 kHz con 10 bits de resolución (`PWM_MAX = 1023`).
 
-### Nodo RX
+---
 
-- ESP32 DevKit/WROOM.
-- LDR o detector optico conectado al ADC GPIO34.
-- Pulsador en GPIO14 con `INPUT_PULLUP`.
-- LEDs de estado:
-  - Rojo: GPIO25.
-  - Verde: GPIO26.
-  - Azul: GPIO27.
+## 3. Mapeo de Pines (ESP32 DevKit V1)
 
-Modos:
+| Señal | Pin ESP32 | Función | Destino en Hardware |
+|---|:---:|---|---|
+| **FOTO0** | `GPIO36` (VP) | Entrada ADC1 Ch0 | LDR 0 (Superior izquierdo) |
+| **FOTO1** | `GPIO39` (VN) | Entrada ADC1 Ch3 | LDR 1 (Superior derecho) |
+| **FOTO2** | `GPIO34` | Entrada ADC1 Ch6 | LDR 2 (Inferior izquierdo) |
+| **FOTO3** | `GPIO35` | Entrada ADC1 Ch7 | LDR 3 (Inferior derecho) |
+| **PWM_AZ** | `GPIO25` | Salida PWM (LEDC CH0) | ENA / Entrada PWM motor Azimut |
+| **PWM_EL** | `GPIO26` | Salida PWM (LEDC CH1) | ENB / Entrada PWM motor Elevación |
+| **DIR_AZ** | `GPIO27` | Salida Digital | IN_A / Sentido de giro Azimut |
+| **DIR_EL** | `GPIO14` | Salida Digital | IN_B / Sentido de giro Elevación |
+| **STATUS** | `GPIO2` | Salida Digital | LED onboard (Heartbeat / Fault) |
 
-- Normal: decodifica tramas y muestra estado del enlace.
-- Direccionamiento: usa el LED azul para indicar incidencia del haz sobre el LDR.
+---
 
-## Compilacion y carga
+## 4. Estructura del Repositorio
 
-Instalar PlatformIO. Luego, desde la raiz del repo:
+*   [`src/main_tracker.cpp`](src/main_tracker.cpp): Firmware principal en C++ para la ESP32.
+*   [`platformio.ini`](platformio.ini): Configuración de compilación para ESP32 DOIT DevKit V1.
+*   [`Kicad/Control de panel/`](Kicad/Control%20de%20panel/): Proyecto de esquemático y PCB en KiCad adaptado para zócalo ESP32 DevKit V1 30 pines.
+*   [`docs/`](docs/):
+    *   [`CONTEXTO_TD2_SUN_TRACKER.md`](docs/CONTEXTO_TD2_SUN_TRACKER.md): Contexto técnico detallado y trazabilidad del proyecto.
+    *   [`DOCUMENTO_TECNICO_TD2_SUN_TRACKER.md`](docs/DOCUMENTO_TECNICO_TD2_SUN_TRACKER.md): Especificación técnica formal y modelo matemático.
+    *   [`PLANMODE_ARMADO_TD2.md`](docs/PLANMODE_ARMADO_TD2.md): Guía de validación y puesta en marcha en banco por etapas.
+*   [`INFORMACION VIEJA/`](INFORMACION%20VIEJA/): Archivos históricos de referencia (informe final UNDEFI 263, esquemático analógico y firmware AVR en C).
+
+---
+
+## 5. Compilación y Carga
+
+Con [PlatformIO](https://platformio.org/) instalado:
 
 ```powershell
-pio run -e tx
-pio run -e rx
+# Compilar el firmware del Sun Tracker
+pio run -e tracker
+
+# Cargar a la placa ESP32 (ajustar puerto COM en platformio.ini si difiere)
+pio run -e tracker -t upload
+
+# Abrir el monitor serie (115200 baud)
+pio device monitor -e tracker
 ```
-
-Para cargar firmware:
-
-```powershell
-pio run -e tx -t upload
-pio run -e rx -t upload
-```
-
-Los puertos configurados actualmente en `platformio.ini` son:
-
-- TX: `COM4`.
-- RX: `COM5`.
-
-Si Windows asigna otros puertos, actualizar `upload_port` y `monitor_port`.
-
-## Dashboard RX
-
-El RX levanta un punto de acceso WiFi:
-
-- SSID: `FSO-RX`.
-- Password: `fso12345`.
-- IP: `192.168.4.1`.
-
-Despues de conectarse al AP, abrir:
-
-```text
-http://192.168.4.1/
-```
-
-API de estado:
-
-```text
-http://192.168.4.1/api/state
-```
-
-## Documentacion tecnica
-
-- [Documento tecnico y trazabilidad](docs/DOCUMENTO_TECNICO_OPTOELECTRONICA.md)
-- [Contrato de trama](docs/CONTRATO_TRAMA.md)
-- [Plan de pruebas](docs/PRUEBAS.md)
-- [Arquitectura](docs/ARQUITECTURA.md)
-
-## Relacion con Tecnicas Digitales 2
-
-Este repo no debe mezclar todo el proyecto de Tecnicas Digitales 2. Solo toma el
-modelo de telemetria solar necesario para probar el enlace:
-
-- cuatro lecturas `F0..F3`;
-- errores `errAz` y `errEl`;
-- estados de motores `motAz` y `motEl`;
-- tension, corriente y potencia.
-
-La regla es simple: si el archivo sirve para compilar, cargar, probar o documentar
-la comunicacion laser actual, va en este repo. Si pertenece al desarrollo completo
-del tracker solar o a una version anterior en MicroPython, no se duplica aca.
