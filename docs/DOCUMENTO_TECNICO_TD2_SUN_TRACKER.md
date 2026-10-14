@@ -15,9 +15,9 @@ No se usa como base de diseno de control de motores.
 
 Fuente local verificada:
 
-- `INFORMACION VIEJA/INFORMACION VIEJA/UNDEFI 263 - Informe Final.pdf`
-- `INFORMACION VIEJA/INFORMACION VIEJA/Circuito Eléctrico/Sun_seeker.PDF`
-- `INFORMACION VIEJA/INFORMACION VIEJA/Firmware/Sun Tracker/Sun Tracker/popo/popo/*.c`
+- `docs/legacy/UNDEFI 263 - Informe Final.pdf`
+- `docs/legacy/Circuito Eléctrico/Sun_seeker.PDF`
+- `docs/legacy/firmware_avr/popo/*.c`
 
 Datos recuperables de forma confiable:
 

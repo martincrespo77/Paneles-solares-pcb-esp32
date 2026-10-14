@@ -1,253 +1,336 @@
 /**
  * @file    main_tracker.cpp
  * @brief   Sun Tracker ESP32 — Tecnicas Digitales 2
- * @details Migra el controlador PI del firmware AVR (ATmega168/328, popo.c) a
- *          ESP32 DevKit V1 con PlatformIO/Arduino.
+ * @details Porta el controlador PI del firmware AVR (ATmega168/328, popo.c) a
+ *          ESP32 DOIT DevKit V1 con PlatformIO/Arduino. Pines y calibracion en
+ *          include/config.h.
  *
- * Fuente original: INFORMACION VIEJA/.../popo/popo/{PID_Azim.c, PID_Elev.c,
+ * Fuente original: docs/legacy/firmware_avr/popo/{PID_Azim.c, PID_Elev.c,
  *                  Leo_Fotos.c, Constantes.c, PWM.c, PORT.c}
  *
  * Mapeo AVR -> ESP32
  * ------------------
- *   ADC0 (FOTO0) -> GPIO36   ADC0 (FOTO1) -> GPIO39
- *   ADC2 (FOTO2) -> GPIO34   ADC3 (FOTO3) -> GPIO35
+ *   ADC0..ADC3 (FOTO0..3) -> GPIO36, GPIO39, GPIO34, GPIO35 (ADC1)
  *   OC1A / PB1  -> GPIO25   (LEDC CH0 — PWM azimut)
  *   OC1B / PB2  -> GPIO26   (LEDC CH1 — PWM elevacion)
  *   PB4         -> GPIO27   (sentido azimut)
  *   PB5         -> GPIO14   (sentido elevacion)
  *
- * Datos de hardware faltantes (ver docs/PLANMODE_ARMADO_TD2.md):
- *   - Puente H final no definido  → ajustar pines ENA/ENB/IN segun driver
- *   - Tension real de motores     → se asume 9-12V, verificar en banco
- *   - Finales de carrera          → descomentar FAULT si se conectan
- *
- * @date 2026-06-09
+ * Arquitectura: loop() no bloqueante, planificado con millis() a Ts fijo.
+ * Estados: TRACKING (lazo PI activo), NIGHT (oscuridad, motores parados),
+ *          SENSOR_FAULT (LDR desconectado, motores parados).
  */
 
 #include <Arduino.h>
+#include "config.h"
 
 // ============================================================================
-// PINES — ESP32 DOIT DevKit V1
+// PWM — capa de compatibilidad Arduino-ESP32 2.x / 3.x
 // ============================================================================
+// El core 3.x elimino ledcSetup()/ledcAttachPin() y ledcWrite() pasa a
+// recibir el pin. Asi el firmware compila con ambos.
+static void pwmInit(uint8_t pin, uint8_t ch) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttachChannel(pin, LEDC_FREQ_HZ, LEDC_RES_BITS, ch);
+#else
+    ledcSetup(ch, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttachPin(pin, ch);
+#endif
+}
 
-// Sensores (ADC1, entrada analog. solo lectura — NO usar WiFi simultaneamente)
-constexpr int PIN_F0 = 36;   // ADC1_CH0 — LDR Foto0
-constexpr int PIN_F1 = 39;   // ADC1_CH3 — LDR Foto1
-constexpr int PIN_F2 = 34;   // ADC1_CH6 — LDR Foto2
-constexpr int PIN_F3 = 35;   // ADC1_CH7 — LDR Foto3
-
-// Salidas de control al puente H
-constexpr int PIN_PWM_AZ = 25;   // ENA  — PWM azimut   (LEDC CH0)
-constexpr int PIN_PWM_EL = 26;   // ENB  — PWM elevacion (LEDC CH1)
-constexpr int PIN_DIR_AZ = 27;   // IN_A — sentido azimut
-constexpr int PIN_DIR_EL = 14;   // IN_B — sentido elevacion
-
-// Debug
-constexpr int PIN_STATUS = 2;    // LED integrado — heartbeat
-
-// ============================================================================
-// LEDC (PWM hardware)
-// ============================================================================
-constexpr uint8_t  LEDC_CH_AZ    = 0;
-constexpr uint8_t  LEDC_CH_EL    = 1;
-constexpr uint32_t LEDC_FREQ_HZ  = 1000;   // 1 kHz — compatible con L298/L298N
-constexpr uint8_t  LEDC_RES_BITS = 10;     // 10 bits → 0..1023 (igual que AVR)
-constexpr int      PWM_MAX       = (1 << LEDC_RES_BITS) - 1;  // 1023
-
-// ============================================================================
-// PARAMETROS DE CONTROL — tomados literalmente de Constantes.c (AVR)
-// ============================================================================
-constexpr double KP_AZ    = 5.0;
-constexpr double KI_AZ    = 0.1;
-constexpr double KP_EL    = 5.0;
-constexpr double KI_EL    = 0.1;
-constexpr double RESET_AW = 400.0;   // limite anti-windup
-
-// Zona muerta (nuevo respecto al AVR — evita oscilacion por ruido ADC)
-constexpr int DEAD_BAND = 5;   // cuentas ADC en escala 10 bits
-
-// Periodo de control
-constexpr unsigned long DT_MS = 20;   // 20 ms ≈ 50 Hz
-
-// ============================================================================
-// ESTADO DEL CONTROLADOR
-// ============================================================================
-static double integral_Az = 0.0;
-static double integral_El = 0.0;
-
-// ============================================================================
-// Lee canal ADC, promedia N muestras y convierte 12 bits → 10 bits
-// (AVR usaba ADC de 10 bits; mantener escala para reutilizar constantes PI)
-// ============================================================================
-static int leerADC10(int pin, int n = 8) {
-    long acum = 0;
-    for (int i = 0; i < n; ++i) acum += analogRead(pin);
-    return static_cast<int>((acum / n) >> 2);   // /4 para escalar 12→10 bits
+static void pwmWrite(uint8_t pin, uint8_t ch, uint32_t duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    (void)ch;
+    ledcWrite(pin, duty);
+#else
+    (void)pin;
+    ledcWrite(ch, duty);
+#endif
 }
 
 // ============================================================================
-// Detiene ambos motores de forma segura
+// EJE (azimut / elevacion)
 // ============================================================================
-static void pararMotores() {
-    ledcWrite(LEDC_CH_AZ, 0);
-    ledcWrite(LEDC_CH_EL, 0);
-    integral_Az = 0.0;
-    integral_El = 0.0;
+struct Axis {
+    float       kp;
+    float       ki;
+    uint8_t     pinPwm;
+    uint8_t     pinDir;
+    uint8_t     ledcCh;
+    uint8_t     dirPositiveLevel;
+    uint8_t     pinLimPos;
+    uint8_t     pinLimNeg;
+
+    // Estado
+    float    integral;
+    int8_t   dirSign;       // sentido cargado en el pin DIR: +1, -1, 0 (ninguno aun)
+    uint32_t lastDriveMs;   // ultimo instante con PWM > 0
+    int      pwm;           // ultima salida aplicada (telemetria)
+};
+
+static Axis axisAz = {KP_AZ, KI_AZ, PIN_PWM_AZ, PIN_DIR_AZ, LEDC_CH_AZ,
+                      DIR_AZ_POSITIVE_LEVEL, PIN_LIM_AZ_POS, PIN_LIM_AZ_NEG,
+                      0.0f, 0, 0, 0};
+static Axis axisEl = {KP_EL, KI_EL, PIN_PWM_EL, PIN_DIR_EL, LEDC_CH_EL,
+                      DIR_EL_POSITIVE_LEVEL, PIN_LIM_EL_POS, PIN_LIM_EL_NEG,
+                      0.0f, 0, 0, 0};
+
+/** Carrera activada en el sentido pedido (siempre false si no hay finales). */
+static bool limitActive(const Axis& ax, int8_t sign) {
+#if USE_LIMIT_SWITCHES
+    return digitalRead(sign > 0 ? ax.pinLimPos : ax.pinLimNeg) == HIGH;
+#else
+    (void)ax;
+    (void)sign;
+    return false;
+#endif
+}
+
+/** Motor detenido e integrador en cero. No toca DIR. */
+static void stopAxis(Axis& ax) {
+    pwmWrite(ax.pinPwm, ax.ledcCh, 0);
+    ax.pwm      = 0;
+    ax.integral = 0.0f;
+}
+
+/**
+ * Un paso del PI (PID_Azim.c / PID_Elev.c) + etapa de salida.
+ *
+ *   |e| <= DEAD_BAND → parado, I = 0
+ *   I = sat(I + e, ±RESET_AW)
+ *   u = Kp·e + Ki·I ;  PWM = min(|trunc(u)|, PWM_MAX) ;  sentido = signo(u)
+ *
+ * No hay riesgo de overflow: |e| <= 1023, |I| <= 400 → |u| <= 5155 en float.
+ */
+static void updateAxis(Axis& ax, float error, uint32_t now) {
+    if (fabsf(error) <= DEAD_BAND) {
+        stopAxis(ax);
+        return;
+    }
+
+    ax.integral = constrain(ax.integral + error, -RESET_AW, RESET_AW);
+    const float u = ax.kp * error + ax.ki * ax.integral;
+
+    // Truncado a entero igual que el (int) del AVR; u >= 0 → sentido positivo.
+    const int    raw  = static_cast<int>(u);
+    const int8_t sign = (raw >= 0) ? 1 : -1;
+    int          duty = min(abs(raw), PWM_MAX);
+
+    // Final de carrera: no empujar contra el tope ni acumular integral.
+    if (limitActive(ax, sign)) {
+        stopAxis(ax);
+        return;
+    }
+
+    // Inversion de giro: esperar con PWM = 0 para no invertir un motor en
+    // marcha (pico de corriente en el puente H).
+    if (duty > 0 && sign != ax.dirSign) {
+        if (ax.dirSign != 0 && now - ax.lastDriveMs < DIR_CHANGE_DEADTIME_MS) {
+            duty = 0;
+        } else {
+            const uint8_t neg = (ax.dirPositiveLevel == HIGH) ? LOW : HIGH;
+            digitalWrite(ax.pinDir, sign > 0 ? ax.dirPositiveLevel : neg);
+            ax.dirSign = sign;
+        }
+    }
+
+    pwmWrite(ax.pinPwm, ax.ledcCh, static_cast<uint32_t>(duty));
+    ax.pwm = duty;
+    if (duty > 0) ax.lastDriveMs = now;
+}
+
+// ============================================================================
+// SENSORES
+// ============================================================================
+/** Promedia ADC_SAMPLES lecturas calibradas (mV) y reescala a 0..1023. */
+static int readLdr(uint8_t pin) {
+    uint32_t mv = 0;
+    for (uint8_t i = 0; i < ADC_SAMPLES; ++i) mv += analogReadMilliVolts(pin);
+    mv /= ADC_SAMPLES;
+    const uint32_t counts = (mv * ADC_MAX_COUNT + ADC_FULL_MV / 2) / ADC_FULL_MV;
+    return static_cast<int>(min<uint32_t>(counts, ADC_MAX_COUNT));
+}
+
+// ============================================================================
+// MAQUINA DE ESTADOS DE SEGURIDAD
+// ============================================================================
+enum class State : uint8_t { TRACKING, NIGHT, SENSOR_FAULT };
+
+static const char* stateName(State s) {
+    switch (s) {
+        case State::TRACKING:     return "TRACK";
+        case State::NIGHT:        return "NIGHT";
+        case State::SENSOR_FAULT: return "FAULT";
+    }
+    return "?";
+}
+
+/** Condicion que debe sostenerse `holdMs` seguidos para confirmarse. */
+struct Confirm {
+    bool     pending = false;
+    uint32_t since   = 0;
+
+    bool update(bool cond, uint32_t now, uint32_t holdMs) {
+        if (!cond) {
+            pending = false;
+            return false;
+        }
+        if (!pending) {
+            pending = true;
+            since   = now;
+        }
+        return now - since >= holdMs;
+    }
+    void reset() { pending = false; }
+};
+
+static State   state = State::TRACKING;
+static Confirm nightEnter, nightExit, faultEnter, faultClear;
+
+static void setState(State next) {
+    if (next == state) return;
+    Serial.printf("[STATE] %s -> %s\n", stateName(state), stateName(next));
+    state = next;
+    nightEnter.reset();
+    nightExit.reset();
+    faultEnter.reset();
+    faultClear.reset();
+    if (state != State::TRACKING) {
+        stopAxis(axisAz);
+        stopAxis(axisEl);
+    }
+}
+
+static void updateState(int avg, int minF, uint32_t now) {
+    switch (state) {
+        case State::TRACKING:
+            if (nightEnter.update(avg < NIGHT_ENTER_LEVEL, now, NIGHT_CONFIRM_MS)) {
+                setState(State::NIGHT);
+            } else if (faultEnter.update(avg >= NIGHT_ENTER_LEVEL && minF < SENSOR_MIN_VALID,
+                                         now, SENSOR_FAULT_CONFIRM_MS)) {
+                setState(State::SENSOR_FAULT);
+            }
+            break;
+        case State::NIGHT:
+            if (nightExit.update(avg > NIGHT_EXIT_LEVEL, now, NIGHT_CONFIRM_MS))
+                setState(State::TRACKING);
+            break;
+        case State::SENSOR_FAULT:
+            if (faultClear.update(minF >= SENSOR_MIN_VALID, now, SENSOR_FAULT_CLEAR_MS))
+                setState(State::TRACKING);
+            break;
+    }
+}
+
+/** TRACK: parpadeo 1 Hz | NIGHT: destello corto | FAULT: fijo. */
+static void updateStatusLed(uint32_t now) {
+    const uint32_t phase = now % HEARTBEAT_PERIOD_MS;
+    bool on = false;
+    switch (state) {
+        case State::TRACKING:     on = phase < HEARTBEAT_PERIOD_MS / 2;  break;
+        case State::NIGHT:        on = phase < HEARTBEAT_PERIOD_MS / 20; break;
+        case State::SENSOR_FAULT: on = true;                             break;
+    }
+    digitalWrite(PIN_STATUS, on ? HIGH : LOW);
 }
 
 // ============================================================================
 // SETUP
 // ============================================================================
 void setup() {
-    Serial.begin(115200);
-    Serial.println();
-    Serial.println("============================================");
-    Serial.println(" TD2 — Sun Tracker ESP32  |  boot OK");
-    Serial.println(" Kp=5.0  Ki=0.1  Reset_aw=400  dt=20ms");
-    Serial.println("============================================");
+    // Salidas de potencia primero: motores parados lo antes posible.
+    pwmInit(PIN_PWM_AZ, LEDC_CH_AZ);
+    pwmInit(PIN_PWM_EL, LEDC_CH_EL);
+    pwmWrite(PIN_PWM_AZ, LEDC_CH_AZ, 0);
+    pwmWrite(PIN_PWM_EL, LEDC_CH_EL, 0);
 
-    // Sentido y LED
-    pinMode(PIN_DIR_AZ, OUTPUT);   digitalWrite(PIN_DIR_AZ, LOW);
-    pinMode(PIN_DIR_EL, OUTPUT);   digitalWrite(PIN_DIR_EL, LOW);
-    pinMode(PIN_STATUS, OUTPUT);   digitalWrite(PIN_STATUS, LOW);
+    pinMode(PIN_DIR_AZ, OUTPUT);  digitalWrite(PIN_DIR_AZ, LOW);
+    pinMode(PIN_DIR_EL, OUTPUT);  digitalWrite(PIN_DIR_EL, LOW);
+    pinMode(PIN_STATUS, OUTPUT);  digitalWrite(PIN_STATUS, LOW);
 
-    // ADC: resolucion 12 bits, atenuacion 11 dB (0..3.3 V)
+#if USE_LIMIT_SWITCHES
+    pinMode(PIN_LIM_AZ_POS, INPUT_PULLUP);
+    pinMode(PIN_LIM_AZ_NEG, INPUT_PULLUP);
+    pinMode(PIN_LIM_EL_POS, INPUT_PULLUP);
+    pinMode(PIN_LIM_EL_NEG, INPUT_PULLUP);
+#endif
+
+    // ADC: 12 bits, atenuacion 11 dB (rango util ~0.15..2.45 V lineal)
     analogReadResolution(12);
     analogSetPinAttenuation(PIN_F0, ADC_11db);
     analogSetPinAttenuation(PIN_F1, ADC_11db);
     analogSetPinAttenuation(PIN_F2, ADC_11db);
     analogSetPinAttenuation(PIN_F3, ADC_11db);
 
-    // LEDC PWM — canal azimut
-    ledcSetup(LEDC_CH_AZ, LEDC_FREQ_HZ, LEDC_RES_BITS);
-    ledcAttachPin(PIN_PWM_AZ, LEDC_CH_AZ);
-    ledcWrite(LEDC_CH_AZ, 0);
+    // Buffer TX para que la telemetria no bloquee el lazo (debe ir antes de begin)
+    Serial.setTxBufferSize(1024);
+    Serial.begin(115200);
+    Serial.println();
+    Serial.println("============================================");
+    Serial.println(" TD2 - Sun Tracker ESP32  |  boot OK");
+    Serial.printf(" Kp=%.2f Ki=%.2f Reset_aw=%.0f DB=%.0f Ts=%lums\n",
+                  KP_AZ, KI_AZ, RESET_AW, DEAD_BAND,
+                  static_cast<unsigned long>(CONTROL_PERIOD_MS));
+    Serial.printf(" Finales de carrera: %s\n", USE_LIMIT_SWITCHES ? "SI" : "NO");
+    Serial.println("============================================");
 
-    // LEDC PWM — canal elevacion
-    ledcSetup(LEDC_CH_EL, LEDC_FREQ_HZ, LEDC_RES_BITS);
-    ledcAttachPin(PIN_PWM_EL, LEDC_CH_EL);
-    ledcWrite(LEDC_CH_EL, 0);
-
-    Serial.println("[TD2] Entrando al loop de control...");
+#if USE_LOOP_WDT
+    enableLoopWDT();   // se alimenta automaticamente al terminar cada loop()
+#endif
 }
 
 // ============================================================================
-// LOOP DE CONTROL — dt fijo de DT_MS ms
+// LOOP — planificador no bloqueante a Ts = CONTROL_PERIOD_MS
 // ============================================================================
 void loop() {
-    static unsigned long lastTick = 0;
-    static uint32_t seq = 0;
+    static uint32_t lastTick      = 0;
+    static uint32_t lastTelemetry = 0;
+    static uint32_t overruns      = 0;
 
-    const unsigned long now = millis();
-    if (now - lastTick < DT_MS) return;
-    lastTick = now;
-    ++seq;
+    const uint32_t now = millis();
+    updateStatusLed(now);
 
-    // -------------------------------------------------------------------------
-    // 1. Lectura de sensores (Leo_Fotos.c portado)
-    //    F0=ADC0, F1=ADC1, F2=ADC2, F3=ADC3 en escala 10 bits
-    // -------------------------------------------------------------------------
-    const int F0 = leerADC10(PIN_F0);
-    const int F1 = leerADC10(PIN_F1);
-    const int F2 = leerADC10(PIN_F2);
-    const int F3 = leerADC10(PIN_F3);
-
-    // Validacion basica de sensores (rango ADC: > 10 cuentas = sensor conectado)
-    if (F0 < 10 && F1 < 10 && F2 < 10 && F3 < 10) {
-        if (seq % 50 == 0)
-            Serial.println("[FAULT] Sensores invalidos — motores detenidos");
-        pararMotores();
-        digitalWrite(PIN_STATUS, HIGH);   // LED fijo = fault
-        return;
+    if (now - lastTick < CONTROL_PERIOD_MS) return;
+    lastTick += CONTROL_PERIOD_MS;               // sin deriva acumulada
+    if (now - lastTick >= CONTROL_PERIOD_MS) {   // atraso > 1 periodo: resincronizar
+        lastTick = now;
+        ++overruns;
     }
 
-    // -------------------------------------------------------------------------
-    // 2. Calculo de error (formulas identicas al AVR — PID_Elev.c / PID_Azim.c)
-    // -------------------------------------------------------------------------
-    //   Elevacion: inferior (F2+F3) - superior (F0+F1)
-    //   Azimut:    derecha  (F1+F3) - izquierda (F0+F2)
-    const double Error_El = static_cast<double>(F2 + F3 - F0 - F1) / 2.0;
-    const double Error_Az = static_cast<double>(F1 + F3 - F0 - F2) / 2.0;
+    // 1. Sensores (Leo_Fotos.c) — escala 10 bits
+    const int F0 = readLdr(PIN_F0);
+    const int F1 = readLdr(PIN_F1);
+    const int F2 = readLdr(PIN_F2);
+    const int F3 = readLdr(PIN_F3);
 
-    // -------------------------------------------------------------------------
-    // 3. PI Elevacion (PID_Elev.c portado)
-    //    Sentido AVR: PWM_El >= 0 → PB5=1 (set 0x20) → DIR_EL HIGH
-    //                 PWM_El <  0 → PB5=0 (clr 0xDF) → DIR_EL LOW
-    // -------------------------------------------------------------------------
-    int  pwm_El = 0;
-    bool dir_El = false;
+    const int avg  = (F0 + F1 + F2 + F3) / 4;
+    const int minF = min(min(F0, F1), min(F2, F3));
 
-    if (abs(Error_El) > DEAD_BAND) {
-        integral_El += Error_El;
-        if (integral_El >  RESET_AW) integral_El =  RESET_AW;
-        if (integral_El < -RESET_AW) integral_El = -RESET_AW;
+    // 2. Supervision (noche / sensor desconectado)
+    updateState(avg, minF, now);
 
-        double u_El = (Error_El * KP_EL) + (integral_El * KI_EL);
-        int    raw  = static_cast<int>(u_El);
+    // 3. Error (PID_Elev.c / PID_Azim.c). Division en float; el AVR truncaba.
+    //    Elevacion: inferior (F2+F3) - superior (F0+F1)
+    //    Azimut:    derecha  (F1+F3) - izquierda (F0+F2)
+    const float errEl = static_cast<float>(F2 + F3 - F0 - F1) / 2.0f;
+    const float errAz = static_cast<float>(F1 + F3 - F0 - F2) / 2.0f;
 
-        if (raw >= 0) {
-            dir_El = true;    // PORTB |= 0x20  (PB5 = 1)
-        } else {
-            dir_El = false;   // PORTB &= 0xDF  (PB5 = 0)
-            raw = -raw;
-        }
-        pwm_El = constrain(raw, 0, PWM_MAX);
-    } else {
-        integral_El = 0.0;   // reset integrador en zona muerta
+    // 4. Lazo PI + salida al puente H
+    if (state == State::TRACKING) {
+        updateAxis(axisEl, errEl, now);
+        updateAxis(axisAz, errAz, now);
     }
 
-    // -------------------------------------------------------------------------
-    // 4. PI Azimut (PID_Azim.c portado)
-    //    Sentido AVR: PWM_Az >= 0 → PB4=0 (clr 0xEF) → DIR_AZ LOW
-    //                 PWM_Az <  0 → PB4=1 (set 0x10) → DIR_AZ HIGH
-    // -------------------------------------------------------------------------
-    int  pwm_Az = 0;
-    bool dir_Az = false;
-
-    if (abs(Error_Az) > DEAD_BAND) {
-        integral_Az += Error_Az;
-        if (integral_Az >  RESET_AW) integral_Az =  RESET_AW;
-        if (integral_Az < -RESET_AW) integral_Az = -RESET_AW;
-
-        double u_Az = (Error_Az * KP_AZ) + (integral_Az * KI_AZ);
-        int    raw  = static_cast<int>(u_Az);
-
-        if (raw >= 0) {
-            dir_Az = false;   // PORTB &= 0xEF  (PB4 = 0)
-        } else {
-            dir_Az = true;    // PORTB |= 0x10  (PB4 = 1)
-            raw = -raw;
-        }
-        pwm_Az = constrain(raw, 0, PWM_MAX);
-    } else {
-        integral_Az = 0.0;
-    }
-
-    // -------------------------------------------------------------------------
-    // 5. Aplicar salidas al puente H
-    // -------------------------------------------------------------------------
-    digitalWrite(PIN_DIR_EL, dir_El ? HIGH : LOW);
-    digitalWrite(PIN_DIR_AZ, dir_Az ? HIGH : LOW);
-    ledcWrite(LEDC_CH_EL, pwm_El);
-    ledcWrite(LEDC_CH_AZ, pwm_Az);
-
-    // -------------------------------------------------------------------------
-    // 6. Telemetria serial (cada 500 ms ≈ 25 ciclos a dt=20ms)
-    // -------------------------------------------------------------------------
-    if (seq % 25 == 0) {
+    // 5. Telemetria
+    if (now - lastTelemetry >= TELEMETRY_PERIOD_MS) {
+        lastTelemetry = now;
         Serial.printf(
-            "[%5lu] F0=%4d F1=%4d F2=%4d F3=%4d"
-            " | eAz=%+6.1f eEl=%+6.1f"
-            " | iAz=%+7.1f iEl=%+7.1f"
-            " | pwmAz=%4d(%d) pwmEl=%4d(%d)\n",
-            seq, F0, F1, F2, F3,
-            Error_Az, Error_El,
-            integral_Az, integral_El,
-            pwm_Az, static_cast<int>(dir_Az),
-            pwm_El, static_cast<int>(dir_El)
-        );
+            "[%8lu] %s F=%4d %4d %4d %4d | eAz=%+6.1f eEl=%+6.1f"
+            " | iAz=%+6.1f iEl=%+6.1f | pwmAz=%c%4d pwmEl=%c%4d | ovr=%lu\n",
+            static_cast<unsigned long>(now), stateName(state), F0, F1, F2, F3,
+            errAz, errEl, axisAz.integral, axisEl.integral,
+            axisAz.dirSign < 0 ? '-' : '+', axisAz.pwm,
+            axisEl.dirSign < 0 ? '-' : '+', axisEl.pwm,
+            static_cast<unsigned long>(overruns));
     }
-
-    // Heartbeat LED
-    digitalWrite(PIN_STATUS, (seq % 50 < 25) ? HIGH : LOW);
 }

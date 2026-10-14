@@ -1,98 +1,140 @@
 # Seguidor Solar (Sun Tracker) de 2 Ejes con ESP32
 
 **Cátedra:** Técnicas Digitales 2 — FIE (Facultad de Ingeniería del Ejército)  
-**Estado:** Firmware base implementado y verificado en PlatformIO  
+**Plataforma:** ESP32 DOIT DevKit V1 (30 pines) · PlatformIO / Arduino C++  
+**Estado:** Firmware implementado, compila sin warnings. Pendiente validación en banco.
 
 ---
 
-## 1. Descripción del Proyecto
+## 1. Descripción
 
-Este proyecto consiste en la **migración y modernización del sistema de control del Seguidor Solar (Sun Tracker) de dos ejes** (Azimut y Elevación). 
+Migración del sistema de control de un **seguidor solar de dos ejes** (Azimut y Elevación) desde la plataforma original AVR (**ATmega168/328**, puente H L298HN y CD4053 — informe técnico *UNDEFI 263*) a un **ESP32**.
 
-El sistema original estaba implementado en código de bajo nivel en C para un microcontrolador AVR (**ATmega168/328**) utilizando el puente H L298HN y un demultiplexor CD4053 (referencia: informe técnico `UNDEFI 263` en `INFORMACION VIEJA/`).
-
-En esta etapa se porta el núcleo de control hacia un microcontrolador moderno **ESP32 DOIT DevKit V1 (30 pines)** bajo el framework PlatformIO / Arduino C++, conservando las ecuaciones físicas del lazo de control, la calibración PI probada y la robustez del accionamiento.
+Se conservan las ecuaciones físicas del lazo, la calibración PI probada en el sistema original y la topología de sensado. Se agregan supervisión de seguridad, temporización determinística y una arquitectura de firmware mantenible.
 
 ---
 
-## 2. Arquitectura de Control
+## 2. Arquitectura
 
 ```
-                 [ 4 LDRs en cruz: F0, F1, F2, F3 ]
-                                |
-                                v
-               [ ADC1 del ESP32 (4 canales a 10 bits) ]
-                                |
-                                v
-                [ Cálculo de error (Azimut / Elevación) ]
-                                |
-                                v
-             [ Control PI por eje con Anti-Windup y Deadband ]
-                                |
-                                v
-            [ Generación PWM (LEDC 1 kHz) + Señales de Sentido ]
-                                |
-                                v
-                [ Etapa de Potencia: Puente H Doble ]
-                                |
-                                v
-              [ Motores DC Azimut (P1) y Elevación (P2) ]
+          [ 4 LDR en cruz: F0 F1 / F2 F3 ]   (divisor LDR + 4k7)
+                         |
+                         v
+          [ ADC1 ESP32 — 8 muestras, calibrado, escala 10 bits ]
+                         |
+                         v
+          [ Supervisión: TRACKING / NIGHT / SENSOR_FAULT ]
+                         |
+                         v
+          [ Error Azimut / Elevación ]
+                         |
+                         v
+          [ PI por eje + anti-windup + zona muerta ]
+                         |
+                         v
+          [ PWM LEDC 1 kHz / 10 bits + sentido (tiempo muerto) ]
+                         |
+                         v
+          [ Puente H doble (L298N) ]
+                         |
+                         v
+          [ Motor DC Azimut ]   [ Motor DC Elevación ]
 ```
 
-### Algoritmo y Ley de Control
+### Ley de control
 
-1. **Lectura ADC:** Lee los 4 sensores LDR sobre el ADC1 (evitando conflictos de Wi-Fi), aplicando promediado de 8 muestras y reescalado de 12 a 10 bits (`0..1023`) para mantener compatibilidad con las constantes legadas.
-2. **Cálculo de Error:**
-   - Elevación: `Error_El = (F2 + F3 - F0 - F1) / 2`
-   - Azimut: `Error_Az = (F1 + F3 - F0 - F2) / 2`
-3. **Controlador PI Discreto:**
-   - Ganancias: $K_p = 5.0$, $K_i = 0.1$, $K_d = 0.0$
-   - Límite Anti-Windup: Clamping del integrador a $\pm 400.0$
-   - Zona Muerta (`DEAD_BAND = 5`): Evita oscilaciones por jitter o ruido eléctrico cuando el panel está orientado.
-4. **Modulación PWM:** Canales LEDC a 1 kHz con 10 bits de resolución (`PWM_MAX = 1023`).
+| Paso | Ecuación / valor |
+|---|---|
+| Error elevación | `e_El = (F2 + F3 − F0 − F1) / 2` (inferior − superior) |
+| Error azimut | `e_Az = (F1 + F3 − F0 − F2) / 2` (derecha − izquierda) |
+| Zona muerta | `abs(e) ≤ 5` → motor parado, integrador en 0 |
+| Integrador | `I[k] = sat(I[k−1] + e[k], ±400)` |
+| Acción | `u[k] = Kp·e[k] + Ki·I[k]`, con `Kp = 5.0`, `Ki = 0.1` (por muestra) |
+| Salida | `PWM = min(abs(u), 1023)`, sentido = signo de `u` |
+| Período | `Ts = 20 ms` (50 Hz) → `Ki` continuo equivalente = 5 s⁻¹ |
+
+### Fail-safes
+
+| Condición | Detección | Acción |
+|---|---|---|
+| Noche / oscuridad | Promedio LDR < 40 cuentas durante 10 s (sale con > 80) | Motores parados, LED destello corto |
+| LDR desconectado | Un LDR < 10 cuentas con luz ambiente, 200 ms | Motores parados, LED fijo |
+| Inversión de giro | Cambio de signo de `u` | PWM = 0 durante 40 ms antes de invertir |
+| Final de carrera | Opcional (`USE_LIMIT_SWITCHES`) | Bloquea el sentido activado |
+| Cuelgue del firmware | Watchdog del `loop()` | Reset → arranque con motores parados |
+
+Todos los umbrales están en [`include/config.h`](include/config.h).
 
 ---
 
-## 3. Mapeo de Pines (ESP32 DevKit V1)
+## 3. Mapeo de pines (ESP32 DevKit V1)
 
-| Señal | Pin ESP32 | Función | Destino en Hardware |
+| Señal | Pin | Función | Destino |
 |---|:---:|---|---|
-| **FOTO0** | `GPIO36` (VP) | Entrada ADC1 Ch0 | LDR 0 (Superior izquierdo) |
-| **FOTO1** | `GPIO39` (VN) | Entrada ADC1 Ch3 | LDR 1 (Superior derecho) |
-| **FOTO2** | `GPIO34` | Entrada ADC1 Ch6 | LDR 2 (Inferior izquierdo) |
-| **FOTO3** | `GPIO35` | Entrada ADC1 Ch7 | LDR 3 (Inferior derecho) |
-| **PWM_AZ** | `GPIO25` | Salida PWM (LEDC CH0) | ENA / Entrada PWM motor Azimut |
-| **PWM_EL** | `GPIO26` | Salida PWM (LEDC CH1) | ENB / Entrada PWM motor Elevación |
-| **DIR_AZ** | `GPIO27` | Salida Digital | IN_A / Sentido de giro Azimut |
-| **DIR_EL** | `GPIO14` | Salida Digital | IN_B / Sentido de giro Elevación |
-| **STATUS** | `GPIO2` | Salida Digital | LED onboard (Heartbeat / Fault) |
+| FOTO0 | `GPIO36` (VP) | ADC1_CH0 | LDR superior izquierdo |
+| FOTO1 | `GPIO39` (VN) | ADC1_CH3 | LDR superior derecho |
+| FOTO2 | `GPIO34` | ADC1_CH6 | LDR inferior izquierdo |
+| FOTO3 | `GPIO35` | ADC1_CH7 | LDR inferior derecho |
+| PWM_AZ | `GPIO25` | LEDC CH0 | ENA — motor Azimut |
+| PWM_EL | `GPIO26` | LEDC CH1 | ENB — motor Elevación |
+| DIR_AZ | `GPIO27` | Digital | Sentido Azimut |
+| DIR_EL | `GPIO14` | Digital | Sentido Elevación |
+| STATUS | `GPIO2` | Digital | LED onboard |
+
+Solo se usa **ADC1** (el ADC2 queda inutilizable con WiFi activo) y ningún strapping pin crítico. Se recomienda pull-down de 10 kΩ en ENA/ENB para garantizar motores parados durante el boot.
+
+> **L298N:** cada motor necesita IN1/IN2 complementarios. Con un único pin de sentido por motor hace falta un inversor (en el diseño original lo resolvía el CD4053).
 
 ---
 
-## 4. Estructura del Repositorio
+## 4. Estructura del repositorio
 
-*   [`src/main_tracker.cpp`](src/main_tracker.cpp): Firmware principal en C++ para la ESP32.
-*   [`platformio.ini`](platformio.ini): Configuración de compilación para ESP32 DOIT DevKit V1.
-*   [`Kicad/Control de panel/`](Kicad/Control%20de%20panel/): Proyecto de esquemático y PCB en KiCad adaptado para zócalo ESP32 DevKit V1 30 pines.
-*   [`docs/`](docs/):
-    *   [`CONTEXTO_TD2_SUN_TRACKER.md`](docs/CONTEXTO_TD2_SUN_TRACKER.md): Contexto técnico detallado y trazabilidad del proyecto.
-    *   [`DOCUMENTO_TECNICO_TD2_SUN_TRACKER.md`](docs/DOCUMENTO_TECNICO_TD2_SUN_TRACKER.md): Especificación técnica formal y modelo matemático.
-    *   [`PLANMODE_ARMADO_TD2.md`](docs/PLANMODE_ARMADO_TD2.md): Guía de validación y puesta en marcha en banco por etapas.
-*   [`INFORMACION VIEJA/`](INFORMACION%20VIEJA/): Archivos históricos de referencia (informe final UNDEFI 263, esquemático analógico y firmware AVR en C).
+```
+├── platformio.ini              Configuración de compilación (platform fijada)
+├── include/config.h            Pines, ganancias, tiempos y umbrales
+├── src/main_tracker.cpp        Firmware del tracker
+├── Kicad/Control de panel/     Esquemático y PCB (KiCad), zócalo DevKit 30 pines
+│   └── lib/                    Símbolo y footprint ESP32_DEVKIT_V1_30PIN
+└── docs/
+    ├── CONTEXTO_TD2_SUN_TRACKER.md          Referencia única: contexto y trazabilidad
+    ├── DOCUMENTO_TECNICO_TD2_SUN_TRACKER.md Especificación técnica y modelo
+    ├── PLANMODE_ARMADO_TD2.md               Puesta en marcha en banco por etapas
+    ├── img/                                 Imágenes y diagramas
+    └── legacy/                              Sistema AVR original (solo referencia)
+        ├── UNDEFI 263 - Informe Final.pdf
+        ├── circuito/Sun_seeker.PDF
+        └── firmware_avr/                    Fuentes C del ATmega (popo.c, PID_*.c…)
+```
 
 ---
 
-## 5. Compilación y Carga
+## 5. Compilación y carga
 
-Con [PlatformIO](https://platformio.org/) instalado:
+Requiere [PlatformIO](https://platformio.org/) (extensión de VS Code o CLI). Ajustar `upload_port` / `monitor_port` en `platformio.ini` al puerto COM de la placa.
 
 ```powershell
-# Compilar el firmware del Sun Tracker
-pio run -e tracker
-
-# Cargar a la placa ESP32 (ajustar puerto COM en platformio.ini si difiere)
-pio run -e tracker -t upload
-
-# Abrir el monitor serie (115200 baud)
-pio device monitor -e tracker
+pio run -e tracker                  # compilar
+pio run -e tracker -t upload        # cargar
+pio device monitor -e tracker       # monitor serie a 115200 baud
 ```
+
+Si la placa no entra sola en modo descarga, usar `-e tracker_manual` y mantener presionado **BOOT** al iniciar la carga.
+
+---
+
+## 6. Puesta en marcha
+
+1. **Sin motores:** cargar el firmware y abrir el monitor. Verificar el banner de boot.
+2. **Sensores:** sombrear cada LDR por separado y comprobar que baja solo su canal `F`.
+3. **Signo del error:** iluminar desde abajo → `eEl` positivo; desde la derecha → `eAz` positivo.
+4. **Fail-safes:** desconectar un LDR → `[STATE] TRACK -> FAULT`; tapar todos 10 s → `NIGHT`.
+5. **Motores en vacío:** confirmar que cada eje gira hacia la luz. Si gira al revés, invertir `DIR_*_POSITIVE_LEVEL` en `config.h`.
+6. **Sintonía:** ajustar `DEAD_BAND`, `KP_*`, `KI_*` según la mecánica real.
+
+Formato de telemetría (cada 500 ms):
+
+```
+[   12500] TRACK F= 512  530  498  515 | eAz= +17.5 eEl=  -14.5 | iAz= +35.0 iEl= -29.0 | pwmAz=+  91 pwmEl=-  75 | ovr=0
+```
+
+Guía detallada: [`docs/PLANMODE_ARMADO_TD2.md`](docs/PLANMODE_ARMADO_TD2.md).

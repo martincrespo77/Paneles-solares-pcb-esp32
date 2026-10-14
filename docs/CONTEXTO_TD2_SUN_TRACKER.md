@@ -1,15 +1,21 @@
 # TD2 — Sun Tracker ESP32: Contexto del proyecto y plan de migracion
 
 **Materia:** Tecnicas Digitales 2  
-**Estado:** En desarrollo  
-**Fecha de escritura:** 2026-06-09
+**Estado:** Firmware PI implementado; pendiente validacion en banco  
+**Fecha de escritura:** 2026-06-09 — **Ultima revision:** 2026-10-14
 
 ---
 
 ## 0. Proposito de este documento
 
-Registrar el estado de comprension del problema antes de pedir un plan de implementacion.
+Documento de referencia **unico** del proyecto: contexto, trazabilidad con el
+sistema AVR original, decisiones de migracion y estado actual.
 Si algo esta mal descrito aqui, hay que corregir este documento, no arrancar a codear.
+
+> Reemplaza a `CONTEXTO_MIGRACION_SUN_TRACKER_ESP32.md` (analisis inicial de mayo
+> 2026, cuando se evaluaba MicroPython y se mezclaba con Optoelectronica). Ese
+> archivo se conserva solo como historico en
+> [`legacy/CONTEXTO_MIGRACION_INICIAL.md`](legacy/CONTEXTO_MIGRACION_INICIAL.md).
 
 ---
 
@@ -25,24 +31,24 @@ El microcontrolador cambia de ATmega168/328 a ESP32.
 
 ## 2. Que ya existe (material viejo)
 
-Todo el material fuente esta en `INFORMACION VIEJA/INFORMACION VIEJA/`.
+Todo el material fuente esta en `docs/legacy/`.
 
 ### Informe tecnico
 
-`INFORMACION VIEJA/INFORMACION VIEJA/UNDEFI 263 - Informe Final.pdf`
+`docs/legacy/UNDEFI 263 - Informe Final.pdf`
 
 Describe el sistema completo: objetivo, mecanica, sensores, motores, puente H,
 control PI discreto y circuito electronico.
 
 ### Esquematico electronico
 
-`INFORMACION VIEJA/INFORMACION VIEJA/Circuito Electrico/Sun_seeker.PDF`
+`docs/legacy/circuito/Sun_seeker.PDF`
 
 Circuito con ATmega168/328, L298HN, CD4053BCN, LM7805, LDR (4x) y conectores de motores.
 
 ### Firmware AVR (fuente de referencia principal)
 
-`INFORMACION VIEJA/INFORMACION VIEJA/Firmware/Sun Tracker.rar`
+`docs/legacy/firmware_avr/ (fuentes) y docs/legacy/firmware_avr_original.rar`
 
 Proyecto Atmel Studio. Archivos clave:
 
@@ -203,17 +209,21 @@ Motor azimut + Motor elevacion
 > el L298 o el CD4053 alimentados a 5 V, verificar compatibilidad de entradas.
 > El L298 acepta niveles de 3.3 V en sus entradas de control.
 
-### Estructura del firmware nuevo (`src/main_tracker.cpp`)
+### Estructura del firmware (`src/main_tracker.cpp` + `include/config.h`)
 
-Modulos a implementar (en orden de desarrollo):
-
-1. **Lectura ADC** — leer GPIO36/39/34/35, atenuar, calibrar offset
-2. **Calculo de error** — portar las dos formulas directamente del C viejo
-3. **PI por eje** — portar `PID_Elev.c` y `PID_Azim.c`, escalar a 12 bits
-4. **PWM LEDC** — `ledcSetup` + `ledcWrite` para azimut y elevacion
-5. **Sentido** — `digitalWrite` segun signo del PI
-6. **Zona muerta** — `if (abs(error) < DEAD_BAND) { parar motor }` para evitar oscilacion
-7. **Seguridad** — timeout por sensor invalido, parada manual por Serial
+- `include/config.h`: pines, LEDC, ganancias PI, tiempos y umbrales de seguridad.
+  Es el unico archivo que se toca para recalibrar.
+- `src/main_tracker.cpp`:
+  1. **Lectura ADC** — `analogReadMilliVolts()` (calibrado por eFuse), 8 muestras,
+     reescalado a 10 bits para conservar las constantes del AVR.
+  2. **Supervision** — maquina de estados `TRACKING / NIGHT / SENSOR_FAULT` con
+     histeresis y confirmacion temporal.
+  3. **Calculo de error** — formulas identicas a `PID_Elev.c` / `PID_Azim.c`.
+  4. **PI por eje** — `I = sat(I + e, ±400)`, `u = Kp·e + Ki·I`, zona muerta ±5.
+  5. **Salida** — PWM LEDC 1 kHz / 10 bits + pin de sentido, con tiempo muerto
+     de 40 ms antes de invertir el giro. Finales de carrera opcionales.
+  6. **Planificador** — `loop()` no bloqueante con `millis()`, Ts = 20 ms sin
+     deriva, contador de overruns y watchdog del loop.
 
 ---
 
@@ -279,9 +289,12 @@ Cada uno tiene su propio entorno en `platformio.ini`.
 
 | Elemento | Estado |
 |---|---|
-| `INFORMACION VIEJA/` (firmware AVR fuente) | Existe localmente, en `.rar` |
-| `src/main_tracker.cpp` | **No existe todavia** |
-| `docs/CONTEXTO_TD2_SUN_TRACKER.md` | Este archivo |
-| `platformio.ini` env:tracker | Definido (apunta a `main_tracker.cpp`) |
-| Control PI portado | **Pendiente** |
-| Esquema de pines ESP32 | Propuesto (tabla seccion 5), sin confirmar fisicamente |
+| `docs/legacy/` (informe, esquematico y firmware AVR) | Versionado, fuentes descomprimidas |
+| `src/main_tracker.cpp` + `include/config.h` | Implementado, compila sin warnings (`-Wall -Wextra -Werror`) |
+| `docs/CONTEXTO_TD2_SUN_TRACKER.md` | Este archivo (referencia unica) |
+| `platformio.ini` | `espressif32@6.13.0` (Arduino core 2.0.17) fijado; envs `tracker` y `tracker_manual` |
+| Control PI portado | **Hecho** — pendiente sintonia en banco |
+| Fail-safes (noche, sensor, inversion, WDT) | **Hecho** — umbrales a calibrar con el hardware real |
+| Finales de carrera | Soporte en firmware, deshabilitado (`USE_LIMIT_SWITCHES 0`) |
+| PCB KiCad (`Kicad/Control de panel/`) | Adaptado a ESP32 DevKit V1 30 pines |
+| Esquema de pines ESP32 | Definido en `config.h`, pendiente verificacion fisica |
